@@ -11,7 +11,7 @@ def get_embedding(word, glove_model, oov_vectors):
     Retrieve the GloVe embedding for a word. If the word is OOV, return a random embedding,
     storing it in oov_vectors if it does not already exist.
     """
-    
+
     if word in glove_model:
         return glove_model[word]
     else:
@@ -28,7 +28,7 @@ def get_improved_embedding(word, glove_model, fasttext_model, oov_vectors):
 
     if word in glove_model:
         return glove_model[word]
-    
+
     # Compute the FastText-to-GloVe transformation matrix only once per session
     if not hasattr(get_improved_embedding, "W_fasttext"):
         # Find common words in both FastText and GloVe models
@@ -36,7 +36,7 @@ def get_improved_embedding(word, glove_model, fasttext_model, oov_vectors):
         X_fasttext = np.array([fasttext_model[w] for w in common_words])
         Y_glove = np.array([glove_model[w] for w in common_words])
         get_improved_embedding.W_fasttext, _, _, _ = lstsq(X_fasttext, Y_glove)
-        
+
 
     # If the word is in FastText, transform its embedding to GloVe space
     if word in fasttext_model:
@@ -77,7 +77,7 @@ class SentimentDataset(Dataset):
         tokens = tokens[:self.max_length] + [''] * (self.max_length - len(tokens))
         vectors = [self.get_vector(token) for token in tokens]
         return torch.FloatTensor(vectors), torch.LongTensor([self.labels[idx]])
-    
+
 
 class EnhancedEmbedding(nn.Module):
     def __init__(self, vocab_size, embedding_dim, pretrained_embeddings):
@@ -94,7 +94,7 @@ class EnhancedEmbedding(nn.Module):
 def get_device():
     device_name = ''
     if torch.cuda.is_available():
-        device_name = 'cuda'
+        device_name = 'cuda:0'
     elif torch.mps.is_available():
         device_name = 'mps'
     else:
