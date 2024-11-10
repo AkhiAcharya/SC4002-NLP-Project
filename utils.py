@@ -28,7 +28,7 @@ def get_improved_embedding(word, models, word_to_vector_map):
     """
     glove_model = models["glove"]
     fasttext_model = models["fasttext"]
-    if word_to_vector_map:
+    if word in word_to_vector_map:
         return word_to_vector_map[word]
     if word in glove_model:
         return glove_model[word]
