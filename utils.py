@@ -1,3 +1,5 @@
+import copy
+import itertools
 import re
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -6,26 +8,28 @@ import torch.nn as nn
 import numpy as np
 from scipy.linalg import lstsq
 
-def get_embedding(word, glove_model, oov_vectors):
+def get_embedding(word, models, word_to_vector_map):
     """
     Retrieve the GloVe embedding for a word. If the word is OOV, return a random embedding,
     storing it in oov_vectors if it does not already exist.
     """
-
+    glove_model = models["glove"]
+    if word in word_to_vector_map:
+        return word_to_vector_map[word]
     if word in glove_model:
         return glove_model[word]
-    else:
-        # Check if OOV embedding already exists, else create and store it
-        if word not in oov_vectors:
-            oov_vectors[word] = np.random.normal(size=300)
-        return oov_vectors[word]
+    word_to_vector_map[word] = np.random.normal(size=300)
+    return word_to_vector_map[word]
 
-def get_improved_embedding(word, glove_model, fasttext_model, oov_vectors):
+def get_improved_embedding(word, models, word_to_vector_map):
     """
     Retrieve the embedding for a word from GloVe, or from FastText (transformed to GloVe space),
     or generate a random embedding if OOV in both, storing it in oov_vectors if new.
     """
-
+    glove_model = models["glove"]
+    fasttext_model = models["fasttext"]
+    if word_to_vector_map:
+        return word_to_vector_map[word]
     if word in glove_model:
         return glove_model[word]
 
@@ -42,19 +46,18 @@ def get_improved_embedding(word, glove_model, fasttext_model, oov_vectors):
     if word in fasttext_model:
         transformed_embedding = np.dot(fasttext_model[word], get_improved_embedding.W_fasttext)
         return transformed_embedding
-    else:
-        # Check if OOV embedding already exists, else create and store it
-        if word not in oov_vectors:
-            oov_vectors[word] = np.random.normal(size=300)
-        return oov_vectors[word]
+    word_to_vector_map[word] = np.random.normal(size=300)
+    return word_to_vector_map[word]
 
 
 class SentimentDataset(Dataset):
-    def __init__(self, texts, labels, glove_model, oov_vectors, max_length=50):
+    def __init__(self, texts, labels, glove_model, word_to_vector_map, get_embedding_callback, fasttext_model = None, max_length=50):
         self.texts = texts
         self.labels = labels
         self.glove_model = glove_model
-        self.oov_vectors = oov_vectors
+        self.fasttext_model = fasttext_model
+        self.word_to_vector_map = word_to_vector_map
+        self.get_embedding_callback = get_embedding_callback
         self.max_length = max_length
 
     def __len__(self):
@@ -64,12 +67,18 @@ class SentimentDataset(Dataset):
         return re.findall(r'\b\w+\b', text.lower())
 
     def get_vector(self, word):
-        if word in self.glove_model:
-            return self.glove_model[word]
-        elif word in self.oov_vectors:
-            return self.oov_vectors[word]
-        else:
-            return np.zeros(self.glove_model.vector_size)
+        if word in self.word_to_vector_map:
+            return self.word_to_vector_map[word]
+        params = {
+            "word": word,
+            "models": { 
+                "glove": self.glove_model,
+                "fasttext": self.fasttext_model
+                },
+            "word_to_vector_map": self.word_to_vector_map
+        }
+        self.word_to_vector_map[word] = self.get_embedding_callback(**params)
+        return self.word_to_vector_map[word]
 
     def __getitem__(self, idx):
         text = self.texts[idx]
@@ -104,9 +113,24 @@ def get_device():
 
 def train_model(model, train_loader, val_loader, num_epochs, device, model_name):
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    # Create an embedding layer as a proper nn.Module
+    class LearnableEmbeddings(nn.Module):
+        def __init__(self, dim=300):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(dim))
+            
+        def forward(self, x):
+            return x * self.weight
 
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-
+    embedding_layer = LearnableEmbeddings().to(device)
+    
+    # Combine all parameters
+    optimizer = optim.AdamW([
+        {'params': model.parameters()},
+        {'params': embedding_layer.parameters()}
+    ], lr=0.001, weight_decay=0.01)
+    
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
         T_0=5,
@@ -129,23 +153,26 @@ def train_model(model, train_loader, val_loader, num_epochs, device, model_name)
 
     for epoch in range(num_epochs):
         model.train()
+        embedding_layer.train()
         total_loss = 0
         correct = 0
         total = 0
 
-        for inputs, labels in train_loader:
-            inputs = inputs.to(device)
+        for batch_inputs, labels in train_loader:
+            batch_inputs = batch_inputs.float().to(device)
+            batch_inputs = embedding_layer(batch_inputs)
+            
             labels = labels.squeeze().to(device)
 
             if epoch > 3:
                 alpha = 0.2
                 lam = np.random.beta(alpha, alpha)
-                index = torch.randperm(inputs.size(0)).to(device)
-                mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
-                inputs = mixed_inputs
+                index = torch.randperm(batch_inputs.size(0)).to(device)
+                mixed_inputs = lam * batch_inputs + (1 - lam) * batch_inputs[index]
+                batch_inputs = mixed_inputs
 
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(batch_inputs)
 
             if epoch > 3:
                 loss = lam * criterion(outputs, labels) + (1 - lam) * criterion(outputs, labels[index])
@@ -153,11 +180,11 @@ def train_model(model, train_loader, val_loader, num_epochs, device, model_name)
                 loss = criterion(outputs, labels)
 
             loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(embedding_layer.parameters()), 
+                max_norm=1.0
+            )
             optimizer.step()
-
             ema.update_parameters(model)
 
             total_loss += loss.item()
@@ -167,22 +194,24 @@ def train_model(model, train_loader, val_loader, num_epochs, device, model_name)
 
         train_acc = 100. * correct / total
 
-        ema.eval()
+        # Validation phase
+        model.eval()
+        embedding_layer.eval()
         val_correct = 0
         val_total = 0
 
         with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs = inputs.to(device)
+            for batch_inputs, labels in val_loader:
+                batch_inputs = batch_inputs.float().to(device)
+                batch_inputs = embedding_layer(batch_inputs)
+                
                 labels = labels.squeeze().to(device)
-
-                outputs = ema(inputs)
+                outputs = ema(batch_inputs)
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
 
         val_acc = 100. * val_correct / val_total
-
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
@@ -199,16 +228,18 @@ def train_model(model, train_loader, val_loader, num_epochs, device, model_name)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            best_model_state = model.state_dict()
             patience_counter = 0
             print(f'New best validation accuracy! Saving model...')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': ema.state_dict(),
+                'embedding_state_dict': embedding_layer.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'val_acc': val_acc,
                 'train_acc': train_acc,
-                'history': history
+                'history': history,
             }, f'best_{model_name}.pth')
         else:
             patience_counter += 1
@@ -216,4 +247,34 @@ def train_model(model, train_loader, val_loader, num_epochs, device, model_name)
                 print(f'Early stopping triggered after epoch {epoch+1}')
                 break
 
-    return history
+    return best_model_state, best_val_acc, embedding_layer
+
+def train_and_select_optimal_model(model_class, train_loader, val_loader, num_epochs, device, model_name):
+    best_config = None
+    best_accuracy = 0.0
+    best_model_state = None  # To store the state_dict of the best model
+    config_options = model_class.config_options
+
+    # Generate all combinations of hyperparameter values
+    keys, values = zip(*config_options.items())
+    for config_combination in itertools.product(*values):
+        # Create a configuration dictionary from the combination
+        config = dict(zip(keys, config_combination))
+        # Initialize a new model with the current configuration
+        model = model_class(**config).to(device)
+        model.config = config
+        # Train the model and evaluate on validation set
+        best_model_state, accuracy = train_model(model, train_loader, val_loader, num_epochs, device, model_name)
+
+        # If this model has the best validation accuracy so far, update best_config
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_config = config
+
+    # Load the best model state into a new model instance
+    best_model = model_class(**best_config).to(device)
+    best_model.load_state_dict(best_model_state)
+    best_model.config = best_config
+
+    print(f"Best config: {best_config}, Best accuracy: {best_accuracy}")
+    return best_model, best_config, best_accuracy
